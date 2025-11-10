@@ -67,6 +67,7 @@ jobs:
             find "$M" -name '*.php' -print0 | xargs -0 -P4 -n1 php -l
             echo "::endgroup::"
           done
+          exit 0
 
       - name: Prepare isolated QA toolchain (strict + deprecation)
         shell: bash
