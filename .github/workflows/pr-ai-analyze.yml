@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   analyze_diff:
-    name: Analyze code via GPT-5
+    name: Analyze code via GPT-5.5
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
