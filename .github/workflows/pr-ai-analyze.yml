@@ -1,8 +1,10 @@
 name: AI Scan Magento 2
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_run:
+    workflows: ["Magento Quality Checks"]
+    types:
+      - completed
 
 permissions:
   contents: read
@@ -11,6 +13,7 @@ permissions:
 jobs:
   analyze_diff:
     name: Analyze code via GPT-5
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download PR diff (authenticated, API endpoint)
@@ -70,7 +73,7 @@ jobs:
           # Keep request size sane
           diff_str="$(head -c 15000 pr.diff)"
 
-          task_str=$'Analyze the following Magento 2 / PHP pull request diff. Report two things:\n1) Whether any MAJOR security issue exists — examples: SQL injection, XSS, unsafe use of ObjectManager, missing ACL/resource checks in controllers, improper escaping, unserialize usage, hardcoded secrets, use of eval, unsafe file ops, weak crypto, SSRF/LFI/RFI.\n2) Rough estimate (0–100) of the % of this diff that appears AI-generated (style cues, comment tone, repetition).\nReturn ONLY a JSON object that matches the provided schema (no extra fields).'
+          task_str=$'Analyze the following Magento 2 / PHP pull request diff. Report two things:\n1) Whether any MAJOR security issue exists â€” examples: SQL injection, XSS, unsafe use of ObjectManager, missing ACL/resource checks in controllers, improper escaping, unserialize usage, hardcoded secrets, use of eval, unsafe file ops, weak crypto, SSRF/LFI/RFI.\n2) Rough estimate (0â€“100) of the % of this diff that appears AI-generated (style cues, comment tone, repetition).\nReturn ONLY a JSON object that matches the provided schema (no extra fields).'
 
           # Build payload with json_schema to force proper JSON output
           payload=$(
@@ -150,7 +153,7 @@ jobs:
           sec_issues=$(jq -r '.security_issues' parsed.json)
           details=$(jq -r '.details' parsed.json)
 
-          # Normalize percentage to 0–100 int
+          # Normalize percentage to 0â€“100 int
           if ! echo "$ai_pct" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then ai_pct=0; fi
           ai_int=$(awk -v n="$ai_pct" 'BEGIN{ if (n<0) n=0; if (n>100) n=100; printf("%.0f", n) }')
 
@@ -174,3 +177,4 @@ jobs:
           echo "? Security issues detected in this PR!"
           echo "${DETAILS}"
           exit 1
+
