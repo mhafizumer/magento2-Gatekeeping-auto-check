@@ -25,10 +25,9 @@ class Index extends Action
      * @param Context $context
      * @param PageFactory $resultPageFactory
      */
-    public function __construct(Context $context, PageFactory $resultPageFactory)
+    public function __construct(Context $context)
     {
-        $this->resultPageFactory = $resultPageFactory;
-        return parent::__construct($context);
+        parent::__construct($context);
     }
 
     /**
@@ -37,6 +36,7 @@ class Index extends Action
      */
     public function execute()
     {
+        die(" SHOULD NOT BE HERE ");
         return $this->resultPageFactory->create();
     }
 }
