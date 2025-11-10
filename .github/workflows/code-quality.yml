@@ -1,4 +1,4 @@
-name: PR Quality Checks (Magento Modules)
+name: Magento Quality Checks
 
 on:
   #workflow_dispatch
