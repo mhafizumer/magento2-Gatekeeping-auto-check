@@ -1,0 +1,176 @@
+name: AI Scan Magento 2
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  analyze_diff:
+    name: Analyze code via GPT-5
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download PR diff (authenticated, API endpoint)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          OWNER_REPO="${{ github.repository }}"
+          URL="https://api.github.com/repos/${OWNER_REPO}/pulls/${PR_NUMBER}"
+
+          echo "Fetching diff from: $URL"
+
+          http_code=$(
+            curl -sS -L \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3.diff" \
+              -w "%{http_code}" \
+              -o pr.diff \
+              "$URL"
+          )
+
+          echo "HTTP status: $http_code"
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "? Failed to fetch diff (HTTP $http_code)."
+            curl -sS \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/json" \
+              "$URL" | jq . || true
+            exit 1
+          fi
+
+          size=$(wc -c < pr.diff | tr -d ' ')
+          echo "Downloaded diff size: ${size} bytes"
+          if [ "$size" -lt 20 ]; then
+            echo "? Diff looks empty. Check PR number, repo visibility, and token permissions."
+            head -n 50 pr.diff || true
+            exit 1
+          fi
+
+          echo "Preview (first 20 lines):"
+          head -n 20 pr.diff || true
+
+      - name: Analyze with GPT (Magento/PHP tuned; strict JSON schema)
+        id: gpt
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "? OPENAI_API_KEY is not set in repo secrets."
+            exit 1
+          fi
+
+          # Keep request size sane
+          diff_str="$(head -c 15000 pr.diff)"
+
+          task_str=$'Analyze the following Magento 2 / PHP pull request diff. Report two things:\n1) Whether any MAJOR security issue exists — examples: SQL injection, XSS, unsafe use of ObjectManager, missing ACL/resource checks in controllers, improper escaping, unserialize usage, hardcoded secrets, use of eval, unsafe file ops, weak crypto, SSRF/LFI/RFI.\n2) Rough estimate (0–100) of the % of this diff that appears AI-generated (style cues, comment tone, repetition).\nReturn ONLY a JSON object that matches the provided schema (no extra fields).'
+
+          # Build payload with json_schema to force proper JSON output
+          payload=$(
+            jq -n --arg diff "$diff_str" --arg task "$task_str" '{
+              model: "gpt-5",
+              temperature: 0,
+              max_tokens: 600,
+              response_format: {
+                type: "json_schema",
+                json_schema: {
+                  name: "m2_security_scan",
+                  strict: true,
+                  schema: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      security_issues: { type: "boolean" },
+                      ai_percentage:   { type: "number" },
+                      details:         { type: "string" }
+                    },
+                    required: ["security_issues","ai_percentage","details"]
+                  }
+                }
+              },
+              messages: [
+                {
+                  role: "system",
+                  content: "You are a senior Magento 2 and PHP security auditor. Be precise and concise."
+                },
+                { role: "user", content: $task },
+                { role: "user", content: $diff }
+              ]
+            }'
+          )
+
+          # Call API
+          response=$(curl -sS https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -d "$payload")
+
+          # Save raw response
+          echo "$response" | jq . > analysis.json || { echo "? Non-JSON response from API"; echo "$response"; exit 1; }
+
+          # Show quick shape for debugging
+          echo "OpenAI response summary:"
+          jq '{model, n_choices: (.choices|length), has_error: has("error")}' analysis.json
+
+          # Exit on API error
+          if jq -e '.error' analysis.json >/dev/null; then
+            echo "? OpenAI API error:"
+            cat analysis.json
+            exit 1
+          fi
+
+          # Prefer the validated object if present
+          if jq -e '.choices[0].message.parsed' analysis.json >/dev/null; then
+            jq '.choices[0].message.parsed' analysis.json > parsed.json
+          else
+            content=$(jq -r '.choices[0].message.content // empty' analysis.json)
+            if [ -z "$content" ] || [ "$content" = "null" ]; then
+              echo "? Model did not return valid JSON in message.content:"
+              jq '.choices[0].message' analysis.json
+              exit 1
+            fi
+            echo "$content" | jq . > parsed.json 2>/dev/null || {
+              echo "? Content was not valid JSON:"
+              echo "$content"
+              echo "Full API response follows:"
+              cat analysis.json
+              exit 1
+            }
+          fi
+
+          # Extract + normalize
+          ai_pct=$(jq -r '.ai_percentage' parsed.json)
+          sec_issues=$(jq -r '.security_issues' parsed.json)
+          details=$(jq -r '.details' parsed.json)
+
+          # Normalize percentage to 0–100 int
+          if ! echo "$ai_pct" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then ai_pct=0; fi
+          ai_int=$(awk -v n="$ai_pct" 'BEGIN{ if (n<0) n=0; if (n>100) n=100; printf("%.0f", n) }')
+
+          echo "AI_PERCENT=$ai_int" >> "$GITHUB_ENV"
+          echo "SECURITY_ISSUES=$sec_issues" >> "$GITHUB_ENV"
+          {
+            echo "DETAILS<<EOF"
+            echo "$details"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Output GPT results
+        run: |
+          echo "?? AI-generated code estimate: ${AI_PERCENT}%"
+          echo "???  Security audit details:"
+          echo "${DETAILS}"
+
+      - name: Fail if security issues found
+        if: env.SECURITY_ISSUES == 'true'
+        run: |
+          echo "? Security issues detected in this PR!"
+          echo "${DETAILS}"
+          exit 1
