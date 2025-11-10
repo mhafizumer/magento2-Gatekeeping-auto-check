@@ -1,19 +1,22 @@
-name: Magento Code Quality Checks
+name: PR Quality Checks (Magento Modules)
 
 on:
+  #workflow_dispatch
   pull_request:
-    branches:
-      - main
     types: [opened, synchronize, reopened]
 
 jobs:
-  code-quality:
+  qa:
+    name: PHP STAN-SNIFFER-MAGENTO2 Code Quality checks on Changed Modules
     runs-on: ubuntu-latest
-    name: Code Quality Checks
+
+    env:
+      COMPOSER_ALLOW_SUPERUSER: 1
+      TOOLS_DIR: .qa-tools
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -21,90 +24,180 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.1'
-          extensions: bcmath, ctype, curl, dom, gd, hash, iconv, intl, mbstring, openssl, pdo_mysql, simplexml, soap, xsl, zip
-          tools: composer:v2
+          coverage: none
+          tools: composer
 
-      - name: Get Composer Cache Directory
-        id: composer-cache
-        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
-
-      - name: Cache Composer dependencies
-        uses: actions/cache@v3
+      - name: Composer cache
+        uses: actions/cache@v4
         with:
-          path: ${{ steps.composer-cache.outputs.dir }}
-          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
-          restore-keys: ${{ runner.os }}-composer-
+          path: ~/.composer/cache
+          key: composer-cache-${{ runner.os }}-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            composer-cache-${{ runner.os }}-
 
-      - name: Install dependencies
-        run: composer install --prefer-dist --no-progress --no-suggest
-
-      - name: PHP Lint Check
+      - name: Detect changed Magento modules
+        id: mods
+        shell: bash
         run: |
-          echo "Running PHP Lint..."
-          find . -path ./vendor -prune -o -name "*.php" -print0 | xargs -0 -n1 php -l
-        continue-on-error: false
-
-      - name: Configure PHPCS
-        run: |
-          vendor/bin/phpcs --config-set installed_paths vendor/magento/magento-coding-standard
-          vendor/bin/phpcs --config-set default_standard Magento2
-
-      - name: Run PHPCS
-        run: |
-          echo "Running PHPCS..."
-          vendor/bin/phpcs --standard=Magento2 --extensions=php,phtml --ignore=vendor/,var/,pub/ ./app/code
-        continue-on-error: false
-
-      - name: Run PHPStan
-        run: |
-          echo "Running PHPStan..."
-          vendor/bin/phpstan analyse app/code --level=5
-        continue-on-error: false
-
-      - name: Check for Raw SQL Queries
-        run: |
-          echo "Checking for raw SQL queries..."
-
-          # Search for common raw query patterns
-          FOUND=0
-
-          # Check for direct queries using Connection
-          if grep -r --include="*.php" --exclude-dir={vendor,var,pub} -E "(->query\(|->rawQuery\(|->fetchAll\(|->fetchOne\(|->fetchRow\()" ./app/code; then
-            echo "❌ Found potential raw SQL queries using Connection methods"
-            FOUND=1
-          fi
-
-          # Check for Zend_Db queries
-          if grep -r --include="*.php" --exclude-dir={vendor,var,pub} -E "Zend_Db.*->query\(" ./app/code; then
-            echo "❌ Found Zend_Db raw queries"
-            FOUND=1
-          fi
-
-          # Check for direct SQL strings
-          if grep -r --include="*.php" --exclude-dir={vendor,var,pub} -iE "(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)[\s\*]+.*FROM.*WHERE" ./app/code | grep -v "//"; then
-            echo "❌ Found potential raw SQL statements"
-            FOUND=1
-          fi
-
-          if [ $FOUND -eq 1 ]; then
-            echo ""
-            echo "⚠️  RAW SQL DETECTED!"
-            echo "Please use Magento's QueryBuilder, Repository pattern, or Resource Models instead."
-            echo "Avoid using:"
-            echo "  - \$connection->query()"
-            echo "  - \$connection->rawQuery()"
-            echo "  - Direct SQL strings"
-            exit 1
+          git fetch --no-tags --prune origin +refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
+          MODULES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep -E '^app/code/[^/]+/[^/]+' \
+            | cut -d/ -f1-4 \
+            | sort -u \
+            | tr '\n' ' ')
+          echo "modules=${MODULES}" >> "$GITHUB_OUTPUT"
+          if [ -z "$MODULES" ]; then
+            echo "No Magento modules changed under app/code/*/* — skipping."
           else
-            echo "✅ No raw SQL queries detected"
+            echo "Changed modules: $MODULES"
           fi
-        continue-on-error: false
 
-      - name: Summary
-        if: success()
+      - name: Stop early if nothing to check
+        if: ${{ steps.mods.outputs.modules == '' }}
+        run: echo "No module changes detected. Nothing to run." && exit 0
+
+      - name: PHP syntax lint (only changed modules)
+        env:
+          MODULES: ${{ steps.mods.outputs.modules }}
+        shell: bash
         run: |
-          echo "✅ All  code quality checks passed!"
-          echo "- PHP Lint: Passed"
-          echo "- PHPCS (Magento2 Standard): Passed"
-          echo "- PHPStan: Passed"
-          echo "- Raw SQL Check: Passed"
+          echo "Running PHP lint only on changed modules..."
+          for M in $MODULES; do
+            echo "::group::Linting $M"
+            find "$M" -name '*.php' -print0 | xargs -0 -P4 -n1 php -l
+            echo "::endgroup::"
+          done
+
+      - name: Prepare isolated QA toolchain (strict + deprecation)
+        shell: bash
+        run: |
+          set -e
+          rm -rf "$TOOLS_DIR"
+          mkdir -p "$TOOLS_DIR"
+          cat > "$TOOLS_DIR/composer.json" <<'JSON'
+          {
+            "name": "qa/tools",
+            "type": "project",
+            "minimum-stability": "stable",
+            "prefer-stable": true,
+            "require": {
+              "php": ">=8.0"
+            },
+            "require-dev": {
+              "phpstan/phpstan": "^1",
+              "phpstan/phpstan-deprecation-rules": "^1.1",
+              "phpstan/phpstan-strict-rules": "^1.5",
+              "squizlabs/php_codesniffer": "^3.9",
+              "phpmd/phpmd": "^2.15",
+              "magento/magento-coding-standard": "^23",
+              "dealerdirect/phpcodesniffer-composer-installer": "^1.0",
+              "phpcompatibility/php-compatibility": "^9.3",
+              "enlightn/security-checker": "*",
+              "sebastian/phpcpd": "^6"
+            },
+            "config": {
+              "allow-plugins": {
+                "dealerdirect/phpcodesniffer-composer-installer": true
+              }
+            }
+          }
+          JSON
+          composer install -d "$TOOLS_DIR" --no-interaction --no-progress
+          ROOT="$(pwd)"
+          V_MAGENTO="$ROOT/$TOOLS_DIR/vendor/magento/magento-coding-standard"
+          V_PHPCOMP="$ROOT/$TOOLS_DIR/vendor/phpcompatibility/php-compatibility"
+          "$TOOLS_DIR/vendor/bin/phpcs" --config-set installed_paths "$V_MAGENTO,$V_PHPCOMP"
+          echo "== PHPCS standards installed =="
+          "$TOOLS_DIR/vendor/bin/phpcs" -i
+          if ! "$TOOLS_DIR/vendor/bin/phpcs" -i | grep -q "PHPCompatibility"; then
+            echo "::error::PHPCompatibility standard is not registered with PHPCS in the isolated toolchain."
+            exit 1
+          fi
+
+      - name: Security - Composer vulnerability audit
+        shell: bash
+        run: |
+          "$TOOLS_DIR/vendor/bin/security-checker" security:check composer.lock
+
+      - name: Security - SQLi & XSS heuristics (per changed module)
+        env:
+          MODULES: ${{ steps.mods.outputs.modules }}
+        shell: bash
+        run: |
+          set +e
+          FAIL=0
+          for M in $MODULES; do
+            echo "::group::Heuristics - $M"
+            grep -RIn --include="*.php" -E '->query\(' "$M"; [ $? -eq 0 ] && FAIL=1
+            grep -RIn --include="*.php" -Ei 'raw.*sql' "$M"; [ $? -eq 0 ] && FAIL=1
+            grep -RIn --include="*.php" -E '(\$_GET|\$_POST|\$_REQUEST)' "$M"; [ $? -eq 0 ] && FAIL=1
+            grep -RIn --include="*.php" -E 'echo[^;]*\$[A-Za-z_][A-Za-z0-9_]*' "$M"; [ $? -eq 0 ] && FAIL=1
+            grep -RIn --include="*.php" -E 'print[^;]*\$[A-Za-z_][A-Za-z0-9_]*' "$M"; [ $? -eq 0 ] && FAIL=1
+            echo "::endgroup::"
+          done
+          if [ $FAIL -ne 0 ]; then
+            echo "::error::Potential SQLi/XSS patterns found. Review grep output above."
+            exit 1
+          fi
+          set -e
+
+      - name: Duplicate code detection (phpcpd) per changed module
+        env:
+          MODULES: ${{ steps.mods.outputs.modules }}
+        shell: bash
+        run: |
+          set -e
+          PHPCPD="$TOOLS_DIR/vendor/bin/phpcpd"
+          MIN_LINES=5
+          MIN_TOKENS=70
+          for M in $MODULES; do
+            echo "::group::phpcpd - $M"
+            "$PHPCPD" \
+              --fuzzy \
+              --min-lines="$MIN_LINES" \
+              --min-tokens="$MIN_TOKENS" \
+              --suffix=.php \
+              --exclude vendor \
+              --exclude var \
+              --exclude pub \
+              --exclude generated \
+              "$M"
+            echo "::endgroup::"
+          done
+
+      - name: PHPStan (strict + deprecations) per changed module
+        env:
+          MODULES: ${{ steps.mods.outputs.modules }}
+        shell: bash
+        run: |
+          set -e
+          PHPSTAN="$TOOLS_DIR/vendor/bin/phpstan"
+          for M in $MODULES; do
+            echo "::group::PHPStan - $M"
+            PHPSTAN_LEVEL="${{ vars.PHPSTAN_LEVEL }}"
+            if [ -z "$PHPSTAN_LEVEL" ]; then PHPSTAN_LEVEL=7; fi
+            "$PHPSTAN" analyse "$M" --level="$PHPSTAN_LEVEL" --error-format=github
+            echo "::endgroup::"
+          done
+
+      - name: PHPCS & PHPMD per changed module
+        env:
+          MODULES: ${{ steps.mods.outputs.modules }}
+        shell: bash
+        run: |
+          set -e
+          PHPCS="$TOOLS_DIR/vendor/bin/phpcs"
+          PHPMD="$TOOLS_DIR/vendor/bin/phpmd"
+          for M in $MODULES; do
+            echo "::group::PHPCS (Magento2) - $M"
+            "$PHPCS" \
+              --standard="$TOOLS_DIR/vendor/magento/magento-coding-standard/Magento2" \
+              --extensions=php \
+              --ignore='**/*.less,**/*.css,**/*.scss,**/*.sass,**/*.js,**/*.ts' \
+              --runtime-set ignore_warnings_on_exit 0 \
+              "$M"
+            echo "::endgroup::"
+            echo "::group::PHPMD - $M"
+            "$PHPMD" "$M" text cleancode,codesize,controversial,design,naming,unusedcode
+            echo "::endgroup::"
+          done
