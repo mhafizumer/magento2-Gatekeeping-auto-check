@@ -8,10 +8,8 @@ permissions:
   checks: read
 
 jobs:
-  check-quality-status:
+  audit:
     runs-on: ubuntu-latest
-    outputs:
-      quality-passed: ${{ steps.check-status.outputs.passed }}
     steps:
       - name: Post waiting status
         uses: actions/github-script@v7
@@ -28,8 +26,8 @@ jobs:
               console.log('Could not post comment:', error.message);
             }
       
-      - name: Wait and check quality checks status
-        id: check-status
+      - name: Wait for quality checks
+        id: wait-for-checks
         uses: lewagon/wait-on-check-action@v1.3.4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -37,19 +35,9 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 10
           allowed-conclusions: success
-        continue-on-error: true
-      
-      - name: Set output based on quality check result
-        id: set-output
-        run: |
-          if [ "${{ steps.check-status.outcome }}" == "success" ]; then
-            echo "passed=true" >> $GITHUB_OUTPUT
-          else
-            echo "passed=false" >> $GITHUB_OUTPUT
-          fi
       
       - name: Post skipped message if quality checks failed
-        if: steps.check-status.outcome != 'success'
+        if: failure()
         uses: actions/github-script@v7
         with:
           script: |
@@ -59,12 +47,7 @@ jobs:
               repo: context.repo.repo,
               body: '⏭️ **Code Audit Status:** Skipped - Quality checks must pass before running audit.'
             })
-
-  audit:
-    runs-on: ubuntu-latest
-    needs: check-quality-status
-    if: needs.check-quality-status.outputs.quality-passed == 'true'
-    steps:
+      
       - name: Checkout code
         uses: actions/checkout@v4
       
