@@ -67,3 +67,138 @@ jobs:
             find "$M" -name '*.php' -print0 | xargs -0 -P4 -n1 php -l
             echo "::endgroup::"
           done
+
+      - name: Prepare isolated QA toolchain (strict + deprecation)
+        shell: bash
+        run: |
+          set -e
+          rm -rf "$TOOLS_DIR"
+          mkdir -p "$TOOLS_DIR"
+          cat > "$TOOLS_DIR/composer.json" <<'JSON'
+          {
+            "name": "qa/tools",
+            "type": "project",
+            "minimum-stability": "stable",
+            "prefer-stable": true,
+            "require": {
+              "php": ">=8.0"
+            },
+            "require-dev": {
+              "phpstan/phpstan": "^1",
+              "phpstan/phpstan-deprecation-rules": "^1.1",
+              "phpstan/phpstan-strict-rules": "^1.5",
+              "squizlabs/php_codesniffer": "^3.9",
+              "phpmd/phpmd": "^2.15",
+              "magento/magento-coding-standard": "^23",
+              "dealerdirect/phpcodesniffer-composer-installer": "^1.0",
+              "phpcompatibility/php-compatibility": "^9.3",
+              "enlightn/security-checker": "*",
+              "sebastian/phpcpd": "^6"
+            },
+            "config": {
+              "allow-plugins": {
+                "dealerdirect/phpcodesniffer-composer-installer": true
+              }
+            }
+          }
+          JSON
+          composer install -d "$TOOLS_DIR" --no-interaction --no-progress
+          ROOT="$(pwd)"
+          V_MAGENTO="$ROOT/$TOOLS_DIR/vendor/magento/magento-coding-standard"
+          V_PHPCOMP="$ROOT/$TOOLS_DIR/vendor/phpcompatibility/php-compatibility"
+          "$TOOLS_DIR/vendor/bin/phpcs" --config-set installed_paths "$V_MAGENTO,$V_PHPCOMP"
+          echo "== PHPCS standards installed =="
+          "$TOOLS_DIR/vendor/bin/phpcs" -i
+          if ! "$TOOLS_DIR/vendor/bin/phpcs" -i | grep -q "PHPCompatibility"; then
+            echo "::error::PHPCompatibility standard is not registered with PHPCS in the isolated toolchain."
+            exit 1
+          fi
+
+      - name: Security - Composer vulnerability audit
+        shell: bash
+        run: |
+          "$TOOLS_DIR/vendor/bin/security-checker" security:check composer.lock
+
+      - name: Security - SQLi & XSS heuristics (per changed module)
+        env:
+          MODULES: ${{ steps.mods.outputs.modules }}
+        shell: bash
+        run: |
+          set +e
+          FAIL=0
+          for M in $MODULES; do
+            echo "::group::Heuristics - $M"
+            grep -RIn --include="*.php" -E '->query\(' "$M"; [ $? -eq 0 ] && FAIL=1
+            grep -RIn --include="*.php" -Ei 'raw.*sql' "$M"; [ $? -eq 0 ] && FAIL=1
+            grep -RIn --include="*.php" -E '(\$_GET|\$_POST|\$_REQUEST)' "$M"; [ $? -eq 0 ] && FAIL=1
+            grep -RIn --include="*.php" -E 'echo[^;]*\$[A-Za-z_][A-Za-z0-9_]*' "$M"; [ $? -eq 0 ] && FAIL=1
+            grep -RIn --include="*.php" -E 'print[^;]*\$[A-Za-z_][A-Za-z0-9_]*' "$M"; [ $? -eq 0 ] && FAIL=1
+            echo "::endgroup::"
+          done
+          if [ $FAIL -ne 0 ]; then
+            echo "::error::Potential SQLi/XSS patterns found. Review grep output above."
+            exit 1
+          fi
+          set -e
+
+      - name: Duplicate code detection (phpcpd) per changed module
+        env:
+          MODULES: ${{ steps.mods.outputs.modules }}
+        shell: bash
+        run: |
+          set -e
+          PHPCPD="$TOOLS_DIR/vendor/bin/phpcpd"
+          MIN_LINES=5
+          MIN_TOKENS=70
+          for M in $MODULES; do
+            echo "::group::phpcpd - $M"
+            "$PHPCPD" \
+              --fuzzy \
+              --min-lines="$MIN_LINES" \
+              --min-tokens="$MIN_TOKENS" \
+              --suffix=.php \
+              --exclude vendor \
+              --exclude var \
+              --exclude pub \
+              --exclude generated \
+              "$M"
+            echo "::endgroup::"
+          done
+
+      - name: PHPStan (strict + deprecations) per changed module
+        env:
+          MODULES: ${{ steps.mods.outputs.modules }}
+        shell: bash
+        run: |
+          set -e
+          PHPSTAN="$TOOLS_DIR/vendor/bin/phpstan"
+          for M in $MODULES; do
+            echo "::group::PHPStan - $M"
+            PHPSTAN_LEVEL="${{ vars.PHPSTAN_LEVEL }}"
+            if [ -z "$PHPSTAN_LEVEL" ]; then PHPSTAN_LEVEL=7; fi
+            "$PHPSTAN" analyse "$M" --level="$PHPSTAN_LEVEL" --error-format=github
+            echo "::endgroup::"
+          done
+
+      - name: PHPCS & PHPMD per changed module
+        env:
+          MODULES: ${{ steps.mods.outputs.modules }}
+        shell: bash
+        run: |
+          set -e
+          PHPCS="$TOOLS_DIR/vendor/bin/phpcs"
+          PHPMD="$TOOLS_DIR/vendor/bin/phpmd"
+          for M in $MODULES; do
+            echo "::group::PHPCS (Magento2) - $M"
+            "$PHPCS" \
+              --standard="$TOOLS_DIR/vendor/magento/magento-coding-standard/Magento2" \
+              --extensions=php \
+              --ignore='**/*.less,**/*.css,**/*.scss,**/*.sass,**/*.js,**/*.ts' \
+              --runtime-set ignore_warnings_on_exit 0 \
+              "$M"
+            echo "::endgroup::"
+            echo "::group::PHPMD - $M"
+            "$PHPMD" "$M" text cleancode,codesize,controversial,design,naming,unusedcode
+            echo "::endgroup::"
+          done
+
