@@ -1,25 +1,28 @@
 name: Magento Code Audit (PR)
 
 on:
-  workflow_run:
-    workflows: ["Magento Quality Checks"]
-    types:
-      - completed
+  pull_request:
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
   pull-requests: write
+  checks: read
 
 jobs:
   audit:
-    # Only run if quality checks succeeded
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout PR code
-        uses: actions/checkout@v4
+      - name: Wait for quality checks
+        uses: lewagon/wait-on-check-action@v1.3.4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          check-name: 'PHP STAN-SNIFFER-MAGENTO2 Code Quality checks on Changed Modules'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 10
+
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
@@ -36,28 +39,13 @@ jobs:
           # Add your audit commands here
           echo "Running Magento code audit..."
           
-      - name: Get PR Number
-        id: pr
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { data: pullRequests } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              commit_sha: '${{ github.event.workflow_run.head_sha }}'
-            });
-            
-            if (pullRequests.length > 0) {
-              core.setOutput('number', pullRequests[0].number);
-            }
-          
       - name: Post Audit Report
-        if: steps.pr.outputs.number
+        if: success()
         uses: actions/github-script@v7
         with:
           script: |
             github.rest.issues.createComment({
-              issue_number: ${{ steps.pr.outputs.number }},
+              issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
               body: '✅ Code audit completed successfully!'
