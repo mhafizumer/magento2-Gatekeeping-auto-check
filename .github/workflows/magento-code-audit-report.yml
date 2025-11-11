@@ -1,39 +1,83 @@
 name: Magento Code Audit (PR)
-
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-
 permissions:
   contents: read
   pull-requests: write
   checks: read
 
 jobs:
-  audit:
+  check-quality-status:
     runs-on: ubuntu-latest
+    outputs:
+      quality-passed: ${{ steps.check-status.outputs.passed }}
     steps:
-      - name: Wait for quality checks
+      - name: Post waiting status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.issues.createComment({
+                issue_number: context.payload.pull_request.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: '⏳ **Code Audit Status:** Waiting for quality checks to complete before running audit...'
+              });
+            } catch (error) {
+              console.log('Could not post comment:', error.message);
+            }
+      
+      - name: Wait and check quality checks status
+        id: check-status
         uses: lewagon/wait-on-check-action@v1.3.4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           check-name: 'PHP STAN-SNIFFER-MAGENTO2 Code Quality checks on Changed Modules'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 10
+          allowed-conclusions: success
+        continue-on-error: true
+      
+      - name: Set output based on quality check result
+        id: set-output
+        run: |
+          if [ "${{ steps.check-status.outcome }}" == "success" ]; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Post skipped message if quality checks failed
+        if: steps.check-status.outcome != 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.payload.pull_request.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '⏭️ **Code Audit Status:** Skipped - Quality checks must pass before running audit.'
+            })
 
+  audit:
+    runs-on: ubuntu-latest
+    needs: check-quality-status
+    if: needs.check-quality-status.outputs.quality-passed == 'true'
+    steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
+      
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.1'
           extensions: mbstring, xml, ctype, iconv, intl, pdo_mysql, dom, gd, soap, zip
           coverage: none
-
+      
       - name: Install dependencies
         run: composer install --prefer-dist --no-progress --no-suggest
-
+      
       - name: Run Code Audit
         run: |
           # Add your audit commands here
