@@ -13,6 +13,17 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
+      - name: Post waiting status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '⏳ Code audit is waiting for quality checks to complete...'
+            })
+      
       - name: Wait for quality checks
         uses: lewagon/wait-on-check-action@v1.3.4
         with:
