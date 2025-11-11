@@ -6,12 +6,14 @@ permissions:
   contents: read
   pull-requests: write
   checks: read
+
 jobs:
-  audit:
+  check-quality-status:
     runs-on: ubuntu-latest
+    outputs:
+      quality-passed: ${{ steps.check-status.outputs.passed }}
     steps:
       - name: Post waiting status
-        if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
@@ -26,19 +28,28 @@ jobs:
               console.log('Could not post comment:', error.message);
             }
       
-      - name: Wait for quality checks
-        id: wait-for-checks
+      - name: Wait and check quality checks status
+        id: check-status
         uses: lewagon/wait-on-check-action@v1.3.4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           check-name: 'PHP STAN-SNIFFER-MAGENTO2 Code Quality checks on Changed Modules'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
           wait-interval: 10
-          allowed-conclusions: success  # Only proceed if quality check succeeds
-        continue-on-error: true  # Don't fail the job, just mark this step as failed
+          allowed-conclusions: success
+        continue-on-error: true
+      
+      - name: Set output based on quality check result
+        id: set-output
+        run: |
+          if [ "${{ steps.check-status.outcome }}" == "success" ]; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+          fi
       
       - name: Post skipped message if quality checks failed
-        if: steps.wait-for-checks.outcome != 'success'
+        if: steps.check-status.outcome != 'success'
         uses: actions/github-script@v7
         with:
           script: |
@@ -48,19 +59,16 @@ jobs:
               repo: context.repo.repo,
               body: '⏭️ **Code Audit Status:** Skipped - Quality checks must pass before running audit.'
             })
-      
-      - name: Cancel job if quality checks failed
-        if: steps.wait-for-checks.outcome != 'success'
-        run: |
-          echo "Quality checks did not pass. Skipping audit."
-          exit 0  # Exit successfully to show as "Skipped" not "Failed"
-      
+
+  audit:
+    runs-on: ubuntu-latest
+    needs: check-quality-status
+    if: needs.check-quality-status.outputs.quality-passed == 'true'
+    steps:
       - name: Checkout code
-        if: steps.wait-for-checks.outcome == 'success'
         uses: actions/checkout@v4
       
       - name: Setup PHP
-        if: steps.wait-for-checks.outcome == 'success'
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.1'
@@ -68,17 +76,15 @@ jobs:
           coverage: none
       
       - name: Install dependencies
-        if: steps.wait-for-checks.outcome == 'success'
         run: composer install --prefer-dist --no-progress --no-suggest
       
       - name: Run Code Audit
-        if: steps.wait-for-checks.outcome == 'success'
         run: |
           # Add your audit commands here
           echo "Running Magento code audit..."
           
       - name: Post Audit Report
-        if: steps.wait-for-checks.outcome == 'success' && success()
+        if: success()
         uses: actions/github-script@v7
         with:
           script: |
