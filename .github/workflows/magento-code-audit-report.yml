@@ -6,7 +6,7 @@ on:
     types:
       - completed
     branches:
-      - main
+      - '**'
 permissions:
   contents: read
   pull-requests: write
@@ -193,5 +193,6 @@ jobs:
         shell: bash
         run: |
           cat "audit-reports/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
 
 
