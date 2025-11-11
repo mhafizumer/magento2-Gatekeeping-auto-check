@@ -1,4 +1,4 @@
-name: PR Quality Checks (Magento Modules)
+name: Magento Quality Checks
 
 on:
   #workflow_dispatch
@@ -47,7 +47,7 @@ jobs:
             | tr '\n' ' ')
           echo "modules=${MODULES}" >> "$GITHUB_OUTPUT"
           if [ -z "$MODULES" ]; then
-            echo "No Magento modules changed under app/code/*/* — skipping."
+            echo "No Magento modules changed under app/code/*/* â€” skipping."
           else
             echo "Changed modules: $MODULES"
           fi
@@ -201,3 +201,4 @@ jobs:
             "$PHPMD" "$M" text cleancode,codesize,controversial,design,naming,unusedcode
             echo "::endgroup::"
           done
+
